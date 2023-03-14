@@ -1,5 +1,6 @@
 //SPDX-License-Identifier: BSD-3-Clause
 pragma solidity 0.8.17;
+
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Interfaces/GLPManagerInterface.sol";
 import "./Interfaces/plvGLPInterface.sol";
@@ -15,23 +16,25 @@ import "./Whitelist.sol";
     returned from the getPlvGLPPrice function is denominated in USD wei.
 */
 contract PlvGLPOracle is Ownable {
+    error FirstIndexCannotBeZero();
+    error NOT_AUTHORIZED();
+
     uint256 public averageIndex;
     uint256 public windowSize;
 
-    address public GLP;
-    address public GLPManager;
-    address public plvGLP;
-    address public whitelist;
+    ERC20Interface public GLP;
+    GLPManagerInterface public GLPManager;
+    plvGLPInterface public plvGLP;
+    Whitelist public immutable whitelist;
     uint256 public MAX_SWING;
 
     uint256 private constant BASE = 1e18;
     uint256 private constant DECIMAL_DIFFERENCE = 1e6;
     //1%
-    bool public constant isGLPOracle = true;
 
     struct IndexInfo {
-        uint256 timestamp;
-        uint256 recordedIndex;
+        uint32  timestamp;
+        uint224 recordedIndex;
     }
 
     IndexInfo[] public HistoricalIndices;
@@ -39,17 +42,26 @@ contract PlvGLPOracle is Ownable {
     event IndexAlert(uint256 previousIndex, uint256 possiblyBadIndex, uint256 timestamp);
     event updatePosted(uint256 averageIndex, uint256 timestamp);
 
-    constructor(address _GLP, address _GLPManager, address _plvGLP, address _whitelist, uint256 _windowSize) {
+    constructor(
+        ERC20Interface _GLP,
+        GLPManagerInterface _GLPManager,
+        plvGLPInterface _plvGLP,
+        Whitelist _whitelist,
+        uint256 _windowSize
+    ) payable {
         GLP = _GLP;
         GLPManager = _GLPManager;
         plvGLP = _plvGLP;
         whitelist = _whitelist;
         windowSize = _windowSize;
         MAX_SWING = 1000000000000000; //1%
-        uint256 index = getPlutusExchangeRate();
-        require(index > 0, "First index cannot be zero.");
+        uint224 index = getPlutusExchangeRate();
+        if (index == 0) { revert FirstIndexCannotBeZero(); }
         //initialize indices, this push will be stored in position 0
-        HistoricalIndices.push(IndexInfo(block.timestamp, index));
+        HistoricalIndices.push(IndexInfo(
+            uint32(block.timestamp),
+            index
+        ));
     }
 
     /**
@@ -58,26 +70,29 @@ contract PlvGLPOracle is Ownable {
      */
     function getGLPPrice() public view returns (uint256) {
         //retrieve the minimized AUM from GLP Manager Contract
-        uint256 glpAUM = GLPManagerInterface(GLPManager).getAum(false);
+        uint256 glpAUM = GLPManager.getAum(false);
         //retrieve the total supply of GLP
-        uint256 glpSupply = ERC20Interface(GLP).totalSupply();
+        uint256 glpSupply = GLP.totalSupply();
         //GLP Price = AUM / Total Supply
-        uint256 price = (glpAUM / glpSupply) * DECIMAL_DIFFERENCE;
-        return price;
+        unchecked {
+            return (glpAUM / glpSupply) * DECIMAL_DIFFERENCE;
+        }
     }
 
     /**
         @notice Pulls requisite data from Plutus Vault contract to calculate the current exchange rate.
         @return Returns the current plvGLP/GLP exchange rate directly from Plutus vault contract.
      */
-    function getPlutusExchangeRate() public view returns (uint256) {
+    function getPlutusExchangeRate() public view returns (uint224) {
+        plvGLPInterface _plvGLP = plvGLP;
         //retrieve total assets from plvGLP contract
-        uint256 totalAssets = plvGLPInterface(plvGLP).totalAssets();
+        uint256 totalAssets = _plvGLP.totalAssets();
         //retrieve total supply from plvGLP contract
-        uint256 totalSupply = ERC20Interface(plvGLP).totalSupply();
+        uint256 totalSupply = _plvGLP.totalSupply();
         //plvGLP/GLP Exchange Rate = Total Assets / Total Supply
-        uint256 exchangeRate = (totalAssets * BASE) / totalSupply;
-        return exchangeRate;
+        unchecked {
+            return uint224((totalAssets * BASE) / totalSupply);
+        }
     }
 
     /**
@@ -88,29 +103,30 @@ contract PlvGLPOracle is Ownable {
     function computeAverageIndex() public returns (uint256) {
         uint256 latestIndexing = HistoricalIndices.length - 1;
         uint256 sum;
-        if (latestIndexing <= windowSize) {
-            for (uint256 i = 0; i < latestIndexing; i++) {
+        uint256 _windowSize = windowSize;
+        if (latestIndexing <= _windowSize) {
+            for (uint256 i; i < latestIndexing; ) {
                 sum += HistoricalIndices[i].recordedIndex;
+                unchecked { ++i; }
             }
             averageIndex = sum / HistoricalIndices.length;
-            return averageIndex;
         } else {
-            uint256 firstIndex = latestIndexing - windowSize + 1;
-            for (uint256 i = firstIndex; i <= latestIndexing; i++) {
+            uint256 firstIndex = latestIndexing - _windowSize + 1;
+            for (uint256 i = firstIndex; i <= latestIndexing;) {
                 sum += HistoricalIndices[i].recordedIndex;
+                unchecked { ++i; }
             }
-            averageIndex = sum / windowSize;
-            return averageIndex;
+            averageIndex = sum / _windowSize;
         }
+
+        return averageIndex;
     }
 
     /**
         @notice Returns the value of the previously accepted exchange rate.
      */
     function getPreviousIndex() public view returns (uint256) {
-        uint256 previousIndexing = HistoricalIndices.length - 1;
-        uint256 previousIndex = HistoricalIndices[previousIndexing].recordedIndex;
-        return previousIndex;
+        return HistoricalIndices[HistoricalIndices.length - 1].recordedIndex;
     }
 
     /**
@@ -121,9 +137,16 @@ contract PlvGLPOracle is Ownable {
      */
     function checkSwing(uint256 currentIndex) public returns (bool) {
         uint256 previousIndex = getPreviousIndex();
-        uint256 allowableSwing = (previousIndex * MAX_SWING) / BASE;
-        uint256 minSwing = previousIndex - allowableSwing;
-        uint256 maxSwing = previousIndex + allowableSwing;
+        uint256 allowableSwing;
+        uint256 minSwing;
+        uint256 maxSwing;
+
+        unchecked {
+            allowableSwing = (previousIndex * MAX_SWING) / BASE;
+            minSwing = previousIndex - allowableSwing;
+            maxSwing = previousIndex + allowableSwing;
+        }
+
         if (currentIndex > maxSwing || currentIndex < minSwing) {
             emit IndexAlert(previousIndex, currentIndex, block.timestamp);
             return false;
@@ -133,26 +156,29 @@ contract PlvGLPOracle is Ownable {
 
     /**
         @notice Update the current, cumulative and average indices when required conditions are met.
-        If the price fails to update, the posted price will fall back on the last previously 
+        If the price fails to update, the posted price will fall back on the last previously
         accepted average index. Access is restricted to only whitelisted addresses.
         @dev we only ever update the index if requested update is within +/- 1% of previously accepted
         index.
      */
     function updateIndex() external {
-        require(Whitelist(whitelist).isWhitelisted(msg.sender), "NOT_AUTHORIZED");
+        if (!whitelist.getWhitelisted(msg.sender)) { revert NOT_AUTHORIZED(); }
         uint256 currentIndex = getPlutusExchangeRate();
-        uint256 previousIndex = getPreviousIndex();
-        bool indexCheck = checkSwing(currentIndex);
-        if (!indexCheck) {
-            currentIndex = previousIndex;
-            HistoricalIndices.push(IndexInfo(block.timestamp, currentIndex));
-            averageIndex = computeAverageIndex();
-            emit updatePosted(averageIndex, block.timestamp);
+
+        if (!checkSwing(currentIndex)) {
+            HistoricalIndices.push(IndexInfo(
+                uint32(block.timestamp),
+                uint224(getPreviousIndex())
+            ));
         } else {
-            HistoricalIndices.push(IndexInfo(block.timestamp, currentIndex));
-            averageIndex = computeAverageIndex();
-            emit updatePosted(averageIndex, block.timestamp);
+            HistoricalIndices.push(IndexInfo(
+                uint32(block.timestamp),
+                uint224(currentIndex)
+            ));
         }
+
+        averageIndex = computeAverageIndex();
+        emit updatePosted(averageIndex, block.timestamp);
     }
 
     /**
@@ -161,62 +187,60 @@ contract PlvGLPOracle is Ownable {
         @return Returns the TWAP price of plvGLP denominated in USD wei.
      */
     function getPlvGLPPrice() external view returns (uint256) {
-        uint256 glpPrice = getGLPPrice();
-        uint256 plvGlpPrice = (averageIndex * glpPrice) / BASE;
-        return plvGlpPrice;
+        return (averageIndex * getGLPPrice()) / BASE;
     }
 
     //* ADMIN FUNCTIONS */
 
-    event newGLPAddress(address oldGLPAddress, address newGLPAddress);
-    event newGLPManagerAddress(address oldManagerAddress, address newManagerAddress);
-    event newPlvGLPAddress(address oldPlvGLPAddress, address newPlvGLPAddress);
+    event newGLPAddress(ERC20Interface oldGLPAddress, ERC20Interface newGLPAddress);
+    event newGLPManagerAddress(GLPManagerInterface oldManagerAddress, GLPManagerInterface newManagerAddress);
+    event newPlvGLPAddress(plvGLPInterface oldPlvGLPAddress, plvGLPInterface newPlvGLPAddress);
     event newWindowSize(uint256 oldWindowSize, uint256 newWindowSize);
     event newMaxSwing(uint256 oldMaxSwing, uint256 newMaxSwing);
 
     /**
-        @notice Admin function to update the address of GLP, restricted to only be 
+        @notice Admin function to update the address of GLP, restricted to only be
         usable by the contract owner.
      */
-    function _updateGlpAddress(address _newGlpAddress) external onlyOwner {
-        address oldGLPAddress = GLP;
+    function _updateGlpAddress(ERC20Interface _newGlpAddress) external payable onlyOwner {
+        ERC20Interface oldGLPAddress = GLP;
         GLP = _newGlpAddress;
-        emit newGLPAddress(oldGLPAddress, GLP);
+        emit newGLPAddress(oldGLPAddress, _newGlpAddress);
     }
 
     /**
-        @notice Admin function to update the address of the GLP Manager Contract, restricted to only be 
+        @notice Admin function to update the address of the GLP Manager Contract, restricted to only be
         usable by the contract owner.
      */
-    function _updateGlpManagerAddress(address _newGlpManagerAddress) external onlyOwner {
-        address oldManagerAddress = GLPManager;
+    function _updateGlpManagerAddress(GLPManagerInterface _newGlpManagerAddress) external payable onlyOwner {
+        GLPManagerInterface oldManagerAddress = GLPManager;
         GLPManager = _newGlpManagerAddress;
-        emit newGLPManagerAddress(oldManagerAddress, GLPManager);
+        emit newGLPManagerAddress(oldManagerAddress, _newGlpManagerAddress);
     }
 
     /**
-        @notice Admin function to update the address of plvGLP, restricted to only be 
+        @notice Admin function to update the address of plvGLP, restricted to only be
         usable by the contract owner.
      */
-    function _updatePlvGlpAddress(address _newPlvGlpAddress) external onlyOwner {
-        address oldPlvGLPAddress = plvGLP;
+    function _updatePlvGlpAddress(plvGLPInterface _newPlvGlpAddress) external payable onlyOwner {
+        plvGLPInterface oldPlvGLPAddress = plvGLP;
         plvGLP = _newPlvGlpAddress;
-        emit newPlvGLPAddress(oldPlvGLPAddress, plvGLP);
+        emit newPlvGLPAddress(oldPlvGLPAddress, _newPlvGlpAddress);
     }
 
     /**
-        @notice Admin function to update the moving average window size, restricted to only be 
+        @notice Admin function to update the moving average window size, restricted to only be
         usable by the contract owner.
      */
-    function _updateWindowSize(uint256 _newWindowSize) external onlyOwner {
+    function _updateWindowSize(uint256 _newWindowSize) external payable onlyOwner {
         uint256 oldWindowSize = windowSize;
         windowSize = _newWindowSize;
-        emit newWindowSize(oldWindowSize, windowSize);
+        emit newWindowSize(oldWindowSize, _newWindowSize);
     }
 
-    function _updateMaxSwing(uint256 _newMaxSwing) external onlyOwner {
+    function _updateMaxSwing(uint256 _newMaxSwing) external payable onlyOwner {
         uint256 oldMaxSwing = MAX_SWING;
         MAX_SWING = _newMaxSwing;
-        emit newWindowSize(oldMaxSwing, MAX_SWING);
+        emit newWindowSize(oldMaxSwing, _newMaxSwing);
     }
 }
