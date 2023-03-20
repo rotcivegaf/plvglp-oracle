@@ -55,12 +55,12 @@ contract PlvGLPOracle is Ownable {
         whitelist = _whitelist;
         windowSize = _windowSize;
         MAX_SWING = 1000000000000000; //1%
-        uint224 index = getPlutusExchangeRate();
+        uint256 index = getPlutusExchangeRate();
         if (index == 0) { revert FirstIndexCannotBeZero(); }
         //initialize indices, this push will be stored in position 0
         HistoricalIndices.push(IndexInfo(
             uint32(block.timestamp),
-            index
+            uint224(index)
         ));
     }
 
@@ -69,13 +69,11 @@ contract PlvGLPOracle is Ownable {
         @return Returns the price of GLP denominated in USD wei.
      */
     function getGLPPrice() public view returns (uint256) {
-        //retrieve the minimized AUM from GLP Manager Contract
-        uint256 glpAUM = GLPManager.getAum(false);
-        //retrieve the total supply of GLP
-        uint256 glpSupply = GLP.totalSupply();
         //GLP Price = AUM / Total Supply
         unchecked {
-            return (glpAUM / glpSupply) * DECIMAL_DIFFERENCE;
+            return (
+                GLPManager.getAum(false) / GLP.totalSupply()
+            ) * DECIMAL_DIFFERENCE;
         }
     }
 
@@ -83,15 +81,13 @@ contract PlvGLPOracle is Ownable {
         @notice Pulls requisite data from Plutus Vault contract to calculate the current exchange rate.
         @return Returns the current plvGLP/GLP exchange rate directly from Plutus vault contract.
      */
-    function getPlutusExchangeRate() public view returns (uint224) {
+    function getPlutusExchangeRate() public view returns (uint256) {
         plvGLPInterface _plvGLP = plvGLP;
-        //retrieve total assets from plvGLP contract
-        uint256 totalAssets = _plvGLP.totalAssets();
-        //retrieve total supply from plvGLP contract
-        uint256 totalSupply = _plvGLP.totalSupply();
         //plvGLP/GLP Exchange Rate = Total Assets / Total Supply
         unchecked {
-            return uint224((totalAssets * BASE) / totalSupply);
+            return (
+                _plvGLP.totalAssets() * BASE
+            ) / _plvGLP.totalSupply();
         }
     }
 
@@ -111,8 +107,7 @@ contract PlvGLPOracle is Ownable {
             }
             averageIndex = sum / HistoricalIndices.length;
         } else {
-            uint256 firstIndex = latestIndexing - _windowSize + 1;
-            for (uint256 i = firstIndex; i <= latestIndexing;) {
+            for (uint256 i = latestIndexing - _windowSize + 1; i <= latestIndexing;) {
                 sum += HistoricalIndices[i].recordedIndex;
                 unchecked { ++i; }
             }
